@@ -1,0 +1,359 @@
+import gzip
+import threading
+import time
+import faster_than_requests as frequests
+import requests, json, lxml.html, pprint, os, sys
+from helpers import Helpers
+
+def log_message(log):
+    print(log)
+
+login_data = {
+    'app_version': '303551284', 
+    'source_token': '', 
+    'app_name': 'com.amazon.rabbit', 
+    'requested_token_type': 'access_token', 
+    'source_token_type': 'refresh_token'
+}
+
+auth_headers = {
+    'Host': 'api.amazon.in', 
+    'Content-Type': 'application/json', 
+    'User-Agent': 'Mozilla/5.0 (Linux; Android 4.4.2; SM-G930K Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/30.0.0.0 Mobile Safari/537.36', 
+    'x-amzn-identity-auth-domain': 'api.amazon.in'
+}
+
+with open('registration_data.json', 'r') as (read_json):
+    registration_data = json.load(read_json)
+    login_data['device_metadata'] = registration_data['device_metadata']
+
+_session = requests.Session()
+
+
+class AccessToken(Helpers):
+
+    def __init__(self):
+        Helpers.__init__(self)
+        # self.proxies = {
+        #     'http': 'http://54.172.90.48:8007/',
+        #     'https': 'http://54.172.90.48:8007/'
+        # }
+
+        self.proxies = None
+        self.prep_helpers()
+        self.auto_stop_code = False
+
+        self.code_str = ''
+        self.verify_data = {}
+        self.cookie = ''
+
+        self.auto_stop = False
+        self.response_status = []
+        self.offerIds = set()
+
+    def check_blocks(self):
+
+        running_start_time = time.time_ns()
+        while 1:
+            refresh_headers = {}
+            hmac_header = self.new_post_getoffer(self.access_token)
+            refresh_headers.update(hmac_header)
+            refresh_headers.update(self.headers)
+            refresh_headers.update(self.base_headers)
+
+            tuple_header = list(refresh_headers.items())
+
+            frequests.setHeaders(tuple_header)
+            start_time = time.time_ns()
+            check_block_resp = frequests.gets(self.refresh_block_url)
+            time_consumed = time.time_ns() - start_time
+
+            response_code = int(check_block_resp["status"][0:3])
+
+            if response_code == 200:
+                self.response_status.append(True)
+
+            else:
+                log_message("%-20s : %d" % ("  Status code", response_code))
+                if response_code == 400:
+                    self.response_status.append(False)
+
+            if response_code == 403:
+                EMAIL = self.settings.get('EMAIL')
+                PASSWORD = self.settings.get('PASSWORD')
+                SOURCE_TOKEN = self.settings.get('SOURCE_TOKEN')
+                access_token = self.update_token(EMAIL, PASSWORD, SOURCE_TOKEN)
+                log_message(access_token)
+                if access_token:
+                    self.access_token = access_token
+                self.response_status = []
+                continue
+
+            if response_code == 400:
+                time.sleep(1)
+                continue
+
+            raw_body = check_block_resp["body"]
+            resp_body = {}
+
+            try:
+                resp_body = json.loads(gzip.decompress(raw_body))
+            except:
+                resp_body = json.loads(raw_body)
+
+            offers_list = resp_body["offerList"]  # check_block_resp.json()['offerList']
+            final_offers = []
+
+            if final_offers:
+                print('seen')
+
+            offers_list = [offer for offer in offers_list if offer['offerId'] not in self.offerIds]
+
+            if self.auto_stop:
+                break
+
+            elif self.settings.get('SLEEP_TIME') > time_consumed / 1000000000:
+                time.sleep(self.settings.get('SLEEP_TIME') - time_consumed / 1000000000)
+
+            log_message("%-20s : %fs" % ("  Time", time_consumed / 1000000000))
+
+            if len(offers_list) > 0:
+                with open('offers.txt', 'a+', encoding='utf-8') as (save_offers):
+                    for offer in offers_list:
+                        save_offers.write(str(offer))
+                        save_offers.write("\n")
+                        self.offerIds.add(offer['offerId'])
+
+    def cb_wrapper(self):
+        while True:
+            if self.auto_stop:
+                break
+            try:
+                self.check_blocks()
+            except Exception as e:
+                print(e)
+
+                with open('errors.txt', 'a+') as (t):
+                    t.write(str(e))
+                    t.write("\n")
+
+    def check_code(self):
+        with open('code.txt', 'r') as (code_fp):
+            code = code_fp.read()
+            if self.code_str == code:
+                time.sleep(2)
+                return
+            self.code_str = code
+            if self.code_str:
+                h = {
+                    'Host': 'www.amazon.in',
+                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                     'User-Agent': 'Mozilla/5.0 (Linux; Android 4.4.2; SM-G930K Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/30.0.0.0 Mobile Safari/537.36',
+                     'Accept-Encoding': 'gzip,deflate',
+                     'Accept-Language': 'en-US',
+                     'Cookie': self.cookie,
+                     'X-Requested-With': 'com.amazon.rabbit'
+                     }
+                print("code: " + self.code_str)
+                self.verify_data['code'] = self.code_str
+                self.verify_data['action'] = 'code'
+                if 'option' in self.verify_data:
+                    del self.verify_data['option']
+                pprint.pprint(self.verify_data)
+
+                h['origin'] = 'https://www.amazon.in'
+                h['Content-Type'] = 'application/x-www-form-urlencoded'
+                # h['Referer'] = 'https://www.amazon.com/ap/cvf/verify'
+                print('second verify')
+                verify_response = _session.post('https://www.amazon.in/ap/cvf/verify', headers=h, data=self.verify_data, proxies=self.proxies)
+                # pprint.pprint(dict(verify_response.request.headers))
+                print(verify_response)
+                pprint.pprint(dict(verify_response.headers))
+                print(verify_response.url)
+                print('\n\n')
+                challenge_xml = lxml.html.fromstring(verify_response.content)
+                hidden_inputs = challenge_xml.xpath('//input[@type="hidden"]')
+                print(hidden_inputs)
+                q = {str(elm.attrib.get('name')): str(elm.attrib.get('value')) for elm in hidden_inputs}
+                #savebody = open('body.txt', 'a+')
+                # savebody.write(str(q))
+                pprint.pprint(q)
+
+                if verify_response.status_code == 200:
+                    # verify_response.url
+                    ap_auth_url = verify_response.url
+                    print('ap/auth - ' + ap_auth_url)
+                    get_ap_auth = _session.get(ap_auth_url, headers=h)
+                    print("##################### Url ap auth ########################")
+                    print(get_ap_auth)
+                    print("##################### Headers ap auth ########################")
+                    pprint.pprint(dict(get_ap_auth.headers))
+                    print("##################### Headers ap auth ########################")
+                    if get_ap_auth.status_code == 200:
+                        location = get_ap_auth.url
+                        # get_ap_auth.headers['Location']
+                        a = location.split('openid.oa2.access_token=')
+                        access_token = a[1].split('&')[0]
+                        print('access-token:'+access_token)
+                        print('Second Registering Token')
+                        reg_dat = registration_data
+                        if 'user_id_password' in reg_dat['auth_data']:
+                            del reg_dat['auth_data']['user_id_password']
+                        reg_dat['auth_data']['access_token'] = access_token
+                        registration_response = _session.post('https://api.amazon.in/auth/register',
+                                                              headers=auth_headers,
+                                                              data=json.dumps(reg_dat),
+                                                              proxies=self.proxies)
+                        print("***=>", registration_response.status_code)
+                        if registration_response.status_code == 200:
+                            registration_response_data = registration_response.json()
+                            source_token = registration_response_data['response']['success']['tokens']['bearer'][
+                                'refresh_token']
+                            access_token = registration_response_data['response']['success']['tokens']['bearer'][
+                                'access_token']
+                            print(source_token)
+                            print(access_token)
+                            self.update_settings(access_token, source_token)
+                            for i in range(int(self.settings.get('THREADS'))):
+                                th = threading.Thread(target=self.cb_wrapper())
+                                th.start()
+                            self.auto_stop_code = True
+                            return
+                else:
+                    print(verify_response.text)
+                open('error_code', 'w+')
+            else:
+                time.sleep(2)
+
+    def cb_check_code(self):
+        while True:
+            if self.auto_stop_code:
+                break
+            try:
+                self.check_code()
+            except Exception as e:
+                print(e)
+
+                with open('errors.txt', 'a+') as (t):
+                    t.write(str(e))
+                    t.write("\n")
+
+    def register(self):
+        print('Registering Token')
+        registration_response = _session.post('https://api.amazon.in/auth/register', headers=auth_headers, data=json.dumps(registration_data), proxies=self.proxies)
+        print("***=>", registration_response.status_code)
+        if registration_response.status_code == 200:
+            registration_response_data = registration_response.json()
+            source_token = registration_response_data['response']['success']['tokens']['bearer']['refresh_token']
+            access_token = registration_response_data['response']['success']['tokens']['bearer']['access_token']
+            self.update_settings(access_token, source_token)
+            return access_token
+        if registration_response.status_code == 401:
+            open("not_logging.txt", "w+")
+            open("code.txt", "w+")
+            print(registration_response.text)
+            print('Challenge Detected')
+            registration_response_json = registration_response.json()
+            cookie = 'frc=AEpK2b/ooLD65MJqSN02DHYoZA83r31LkJyCf8maTJ3spQMeT4VAoGMI6BiQWc9Uwvg2eVeIFP70Qgcpm93gQxG+e/voGZ0kOL7dG8a1/+1wrBHJFn/KIeQJUwR1AmkJ8jymHhqa42FM7PDDzMWYNXquhE6y9EvIsNJAnnN+jKMNTr5TI+8NsZmai0c6OMyCYR2rHSizhTgShThxLxVKcXERJnPBCi4mRvqLyfHKZGm9G4mufOLsHSNSq0kcJlFjQAO38NFYbiF4shfTMnWpP7MbZLnRAsAsePmfkrQhWGwhLDHi7yUys0BTguPqliAt2/IJ6367992q9m6cnCT5o5gY+CcUOQVNwQWumQy0DVT8cF4XMtiGWwJb9K1/wu0aCsccqqg666YML20k0S2JINFtUFSmTENdJg==; map-md=eyJhcHBfaW5mbyI6eyJwZXJtaXNzaW9uX3J1bnRpbWVfZ3JhbnQiOjAsImF1dG9fcHYiOjB9LCJkZXZpY2VfZGF0YSI6eyJtb2JpbGVfc2ltX2NvdW50cnlfaXNvIjoiVVMifSwiZGV2aWNlX3JlZ2lzdHJhdGlvbl9kYXRhIjp7InNvZnR3YXJlX3ZlcnNpb24iOiIxMzAwNTAwMDIifSwiZGV2aWNlX3VzZXJfZGljdGlvbmFyeSI6WyJlZHV5MTJfMUBob3RtYWlsLmNvbSIsInRvbWFzcnJmbGV4QGdtYWlsLmNvbSIsInBlcmRvbW9hbWF6b24yMDE4QGdtYWlsLmNvbSIsIm1hbnVlbHJvZHJpZ3VlejdAeWFob28uY29tIl0sImFwcF9pZGVudGlmaWVyIjp7IlNIQS0yNTYiOlsiMmYxOWFkZWIyODRlYjM2ZjdmMDc3ODYxNTJiOWExZDE0YjIxNjUzMjAzYWQwYjA0ZWJiZjljNzNhYjZkNzYyNSJdLCJwYWNrYWdlIjoiY29tLmFtYXpvbi5yYWJiaXQiLCJhcHBfdmVyc2lvbiI6IjMwMzU1MjkxNCIsIm1hcF92ZXJzaW9uIjoiTUFQQW5kcm9pZExpYi0xLjEuMjAwNzAxLjAifX0=; lc-main=en_US; csm-hit=E5KTSWHAF4FN5RJJMC6S+s-E5KTSWHAF4FN5RJJMC6S|1583518499786; x-main="IXRCrd@wRHBCSRqzPYwD1i7F@cAYr9cdQbWv3kPuy4Yt8OLx64WMXA?yk5KjZegs"; at-main=Atza|IwEBIJibNOGRKStITyW0yGa6E-LH-L5wamp8zxjZ3nqdmXTopCHSW5qWEGqkE2w6FOoxgmW49dxQtt55F5d1jwlDXO8PpgCLxp1d5yaJOErnCDt-ZAxJ7B8kFcXU9m41N8khrHCt8p6nJwRGVAOngiZaEIRUnPGVhWsy1Xm9sZJJ8jRRWRfnDn1zJ4idmdoJu1jdHCajhXMyfZzZmlB2GVh1c16upcOwd8KYsIrKP657jXBwFG3_XtmlUM4E5tiP_hJI30h5Ua_SA0Ohuf_4UXq2Gw2sfmh4jmGNcjj3s0h1O-Tckrunk8Hl3TxM7XwI7eNRqYdUqKKmbBK498dt_hjbbhQCRu9yXDV1h4DZ53IYDexFJXSbKfK_ARD1r38dVw6Td6QstkfxVZa5VSYcIVvCjYYoKFujqXXq3d39sAWQuf11ig; sess-at-main="ymHE7ihI6BI7nx2Glvjw+D0m2LSaF9SnyfDDUNrpjso="; session-id=134-9068023-3295945; session-id-time=2214708697l; session-token="5gk+4dDZm4xDSDPrU3hnmqqsHr66YT1EGY1J93mM4UE3bl/dhM5tfcp2eZwrAA8F7qALlypQele7Wm1TD6zYPidxs//lVrtveRyTn6cIbqfaSMG61RDnTuvDBBOb4za9aPVM7RGsx1UTyoXOjRyhMVo3cptDcgmzNlffcITF31xzPI2EaMqFlJ9e27fHRY0CWDxAr48ki/xKf8b34TdLCW/e/MEY+HjUXJCD4v2KScU="; ubid-main=133-6948666-9891955; sid='
+
+            h = {'Host': 'www.amazon.in', 
+             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8', 
+             'User-Agent': 'Mozilla/5.0 (Linux; Android 4.4.2; SM-G930K Build/NRD90M) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/30.0.0.0 Mobile Safari/537.36', 
+             'Accept-Encoding': 'gzip,deflate', 
+             'Accept-Language': 'en-US', 
+             'X-Requested-With': 'com.amazon.rabbit', 
+             'Cookie': cookie}
+
+            challenge_url = registration_response_json['response']['challenge']['uri'] + '&openid.oa2.client_id=device%3A33656435363264303837646634613737616163346662373163333632323237322341314d50534c4643374c3541464b&openid.oa2.response_type=token&openid.ns.pape=http%3A%2F%2Fspecs.openid.net%2Fextensions%2Fpape%2F1.0&pageId=amzn_device_common_dark&openid.claimed_id=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.assoc_handle=amzn_device_in&disableLoginPrepopulate=0&accountStatusPolicy=P1&openid.pape.max_auth_age=0&openid.ns.oa2=http%3A%2F%2Fwww.amazon.com%2Fap%2Fext%2Foauth%2F2&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&openid.identity=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0%2Fidentifier_select&openid.mode=checkid_setup&language=en_IN&openid.oa2.scope=device_auth_access&openid.return_to=https%3A%2F%2Fwww.amazon.in%2Fap%2Fmaplanding'
+            print('\n\n#########################')
+            print(challenge_url)
+            print('\n\n#########################')
+            get_challenge = _session.get(challenge_url, headers=h)
+            print('\n\n')
+            pprint.pprint(dict(get_challenge.request.headers))
+            print(get_challenge)
+            pprint.pprint(dict(get_challenge.headers))
+            print(get_challenge.url)
+            print('\n\n')
+            challenge_xml = lxml.html.fromstring(get_challenge.content)
+            hidden_inputs = challenge_xml.xpath('//input[@type="hidden"]')
+            print(hidden_inputs)
+            print(hidden_inputs[0].attrib)
+            self.verify_data = {str(elm.attrib.get('name')): str(elm.attrib.get('value')) for elm in hidden_inputs}
+            pprint.pprint(self.verify_data)
+        # request
+        #
+        #     request_url = 'https://www.amazon.com' + get_challenge.headers['Location']
+        #     print(request_url)
+        #     h['Host'] = 'www.amazon.com'
+        #     h['Accept-Language'] = 'en-US'
+        #     h['Cookie'] = 'frc=AINcvOZLvgIcfsYM4/VlGVW26BhKe985KBf1J0rX86nVhFFU8hO58h6XbeYCjyx/+9hDtAKJkq1GTOgw5G5O+yvI3zFko5kcbyj0TZd0BFMRmOsKN3zkcwJBXq14Kmb2prNo+IXYhgCwz+aOzinlR9wuIRa3Pxx6MbGDJouiYGYXgIM7fMI/B1JuDkXnCVRHi3TLebPe5AexHsxGc/wEqd+bnQq2jm5QnUjI1WHgkG2BEAdRbLrt/4uJ84X03ZMdzMGGXuxw+MNViwV126BextGxyKU7aPqx+iBT2hO9Yk5l+k01+xVdsleNpfF/codrHDcX7gK8x0yAramC5t8sVQylYu4ZqOO4n3XCETsLxtv5ypBJJLfpDmgn4Bx9YusTEn3mSD/Ps5GdhSU62+mKqtLgG3EuXMwOjA==; map-md=eyJhcHBfaW5mbyI6eyJwZXJtaXNzaW9uX3J1bnRpbWVfZ3JhbnQiOjAsImF1dG9fcHYiOjB9LCJkZXZpY2VfZGF0YSI6eyJtb2JpbGVfc2ltX2NvdW50cnlfaXNvIjoiVVMifSwiZGV2aWNlX3JlZ2lzdHJhdGlvbl9kYXRhIjp7InNvZnR3YXJlX3ZlcnNpb24iOiIxMzAwNTAwMDIifSwiZGV2aWNlX3VzZXJfZGljdGlvbmFyeSI6WyJlZHV5MTJfMUBob3RtYWlsLmNvbSIsInBlcmRvbW9hbWF6b24yMDE4QGdtYWlsLmNvbSIsIm1hbnVlbHJvZHJpZ3VlejdAeWFob28uY29tIl0sImFwcF9pZGVudGlmaWVyIjp7IlNIQS0yNTYiOlsiMmYxOWFkZWIyODRlYjM2ZjdmMDc3ODYxNTJiOWExZDE0YjIxNjUzMjAzYWQwYjA0ZWJiZjljNzNhYjZkNzYyNSJdLCJwYWNrYWdlIjoiY29tLmFtYXpvbi5yYWJiaXQiLCJhcHBfdmVyc2lvbiI6IjMwMzU1MjkxNCIsIm1hcF92ZXJzaW9uIjoiTUFQQW5kcm9pZExpYi0xLjEuMjAwNzAxLjAifX0=; lc-main=en_US; csm-hit=E5KTSWHAF4FN5RJJMC6S+s-E5KTSWHAF4FN5RJJMC6S|1583518499786; x-main="oDn7JqeS6Yg6QWfgbj7gWOjEg9tO8BEtza6FriBJ?Qe1d02jAVpMR@STNBwKZOAx"; at-main=Atza|IwEBICy7aivGIt0nSuNdHlu7aV6_HOYfloqk49NCjMPZcd33AhruOrvU3Y631tXxoXLZjCK8CS7333A3kGr-3Ab8HedaNJIZAJvIb5JqrZn-3EBPjaOJ7T9-GOkSz-JRCJJSYQH8SUeOD8Vl4qs19ZGH3t2_SmIC9Gzfu6gmRE_t7_jOfpHUh6Y_DW7TCRk8oIEnJhSU_HSUhv8c6lNacWQkq9joNuBkmIbv5CRaVG-DXw9QHHR6ZTqvkhIw544wm35-I2f7EXthUXcl5PLa2lZow1cQ9hLcb64JhhUl8p3QTKrU_P03BzPJfyPHR4pxpimj0LrbG3JesNqlKl6ovyO8h2kRujNiDti4m9xD6Cl2t9XUEeOoe26ETSpeWxbAAdEk-pC0RgaJzO9C-TJUMeri3Uw0DSqqrorWdZxebrd8DNoqE5TnGGV1a3QcXRS9iN_9aCE; sess-at-main="w+DWSLg1jvjMwUj+rH6bbTsJgTBqE/7bi6Ghhwtccbw="; sid=; session-id=134-9068023-3295945; session-id-time=2214482015l; ubid-main=133-6948666-9891955; session-token="ErWqms6WK/Sr/ykPBdIdwF1wKWb6T5qhrJWWXs1Um9iO1MttheAUb08Lud+z7AyuPFBJ1t+1W5oOKRdn+WxFNOZeG9BsWcXIdwL6tHHf+tpJYMYnvBWjk86U0hWVLpObOzxGHwyW1sO6vuQ5oiPOAS5HEfSBsvQtleg1XoGL4S1ZVm0vGd1XOmauhZKGHygmnh8Ulb5Q5u+4txt21wjOEruYSpP/ob05xDLQuIYFs7E="'
+        #     get_request = _session.get(request_url, headers=h)
+
+        # first verify api
+            h['origin'] = 'https://www.amazon.in'
+            h['Content-Type'] = 'application/x-www-form-urlencoded'
+            # h['Referer'] = get_challenge.url
+            # self.cookie = cookie + ';' + ';'.join(get_challenge.cookies)
+            # h['Cookie'] = self.cookie
+            self.cookie = cookie
+            h['Cookie'] = self.cookie
+            print('first verify')
+            verify_response = _session.post('https://www.amazon.in/ap/cvf/verify', headers=h, data=self.verify_data, proxies=self.proxies)
+            print(verify_response)
+            pprint.pprint(dict(verify_response.headers))
+            if verify_response.status_code == 200:
+                th = threading.Thread(target=self.cb_check_code())
+                th.start()
+                print('check code thread started')
+                return
+            else:
+                print(verify_response.text)
+                return
+        # start thread(every 2s monitoring)
+        # second verify api on this thread, call second register
+        else:
+            print(registration_response.text)
+        print('Error occured while registering, check your username and password')
+
+    def refresh(self):
+        auth_headers_refresh = auth_headers.copy()
+        auth_headers_refresh['User-Agent'] = 'AmazonWebView/MAPClientLib/130050002/Android/4.4.2/SM-G955N'
+        refresh_response = _session.post('https://api.amazon.in/auth/token', headers=auth_headers_refresh, data=json.dumps(login_data), proxies=self.proxies)
+
+        if refresh_response.status_code == 200:
+            refresh_response_data = refresh_response.json()
+            access_token = refresh_response_data['access_token']
+            self.update_settings(access_token, self.SOURCE_TOKEN)
+            print("=================")
+            print(refresh_response_data)
+            print("*****************")
+            return access_token
+        if refresh_response.status_code == 401:
+            print('Code Verification required')
+        else:
+            if refresh_response.status_code == 400:
+                print('Removing source token from file and refreshing')
+                print(refresh_response.text)
+                access_token = self.settings.get('ACCESS_TOKEN')
+                self.update_settings(access_token, '')
+                self.update_token(self.EMAIL, self.PASSWORD, '')
+        print('Error occured while registering, check your username and password')
+
+    def update_token(self, EMAIL, PASSWORD, SOURCE_TOKEN):
+        self.SOURCE_TOKEN = SOURCE_TOKEN
+        self.EMAIL = EMAIL
+        self.PASSWORD = PASSWORD
+
+        login_data['source_token'] = SOURCE_TOKEN
+        registration_data['auth_data']['user_id_password']['user_id'] = EMAIL
+        registration_data['auth_data']['user_id_password']['password'] = PASSWORD
+
+        if self.SOURCE_TOKEN:
+            access_token = self.refresh()
+            if access_token:
+                return access_token
+        else:
+            access_token = self.register()
+        if access_token:
+            return access_token
